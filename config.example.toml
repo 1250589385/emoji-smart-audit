@@ -1,0 +1,17 @@
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[audit]
+enabled = true            # 是否启用语境审核
+strip_emoji = true        # 清理文本里的 emoji（笑哭类），与审核独立
+vision_model = "auto"     # auto=自动选宿主可用视觉模型
+auto_try_limit = 3
+judge_model = "fast_model"
+strictness = "normal"     # loose / normal / strict
+context_limit = 12        # 判断时参考最近多少条聊天
+timeout_seconds = 12.0
+timeout_action = "keep"   # keep=超时放行，drop=超时撤掉表情
+audit_rate = 1.0          # 审核概率
+skip_if_text_too_short = 2
+log_decisions = true
