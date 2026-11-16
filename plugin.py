@@ -105,6 +105,16 @@ class AuditSection(PluginConfigBase):
             "order": 1,
         },
     )
+
+    strip_emoji: bool = Field(
+        default=True,
+        description="是否自动清除回复里的 emoji 表情符号",
+        json_schema_extra={
+            "label": "清除 emoji",
+            "hint": "模型爱发😂这类表情，QQ 会转成系统表情显示，一条消息多个时会连发。开启后自动从文本里删掉",
+            "order": 11,
+        },
+    )
     vision_model: VisionModelChoice = Field(  # type: ignore[valid-type]
         default="auto",
         description="看图用的模型",
@@ -259,21 +269,79 @@ def _list_vision_models() -> list[str]:
     return names
 
 
+import unicodedata
+
+
+# 要清理的 emoji 范围：图形类 emoji（笑哭/emoji 表情），但保留中文标点和普通符号
+def _is_emoji_char(ch: str) -> bool:
+    """判断单字符是否为 emoji 类字符。"""
+    cp = ord(ch)
+    # 常见 emoji 区段
+    if 0x1F300 <= cp <= 0x1F9FF:   # 各类 emoji（含😂🤣😅😊👍）
+        return True
+    if 0x1FA00 <= cp <= 0x1FAFF:
+        return True
+    if 0x2600 <= cp <= 0x27BF:     # 杂项符号（☀☂✂✈等）
+        return True
+    if 0xFE00 <= cp <= 0xFE0F:     # 变体选择符
+        return True
+    if 0x1F000 <= cp <= 0x1F02F:   # 麻将牌
+        return True
+    if 0x1F1E6 <= cp <= 0x1F1FF:   # 区域指示符（国旗 emoji）
+        return True
+    if cp in (0x200D, 0x20E3):      # ZWJ / 组合键帽
+        return True
+    return False
+
+
+def _strip_emoji_from_text(text: str) -> tuple[str, int]:
+    """从文本中移除 emoji，返回 (新文本, 移除数量)。"""
+    if not text:
+        return text, 0
+    kept = []
+    removed = 0
+    for ch in text:
+        if _is_emoji_char(ch):
+            removed += 1
+            continue
+        kept.append(ch)
+    if removed == 0:
+        return text, 0
+    new_text = "".join(kept)
+    # 清理多余空格
+    new_text = re.sub(r"\s{2,}", " ", new_text).strip()
+    return new_text, removed
+
+
+def _component_list(message: dict[str, Any]) -> list[Any] | None:
+    """取消息组件列表，兼容 dict.components / 裸列表两种序列化。"""
+    raw = message.get("raw_message")
+    if isinstance(raw, dict):
+        comps = raw.get("components")
+        return comps if isinstance(comps, list) else None
+    if isinstance(raw, list):
+        return raw
+    return None
+
+
 def _get_text(message: dict[str, Any]) -> str:
-    parts = message.get("raw_message")
-    if not isinstance(parts, list):
-        return ""
-    chunks = [
-        str(p.get("data") or "")
-        for p in parts
-        if isinstance(p, dict) and p.get("type") == "text"
-    ]
-    return "".join(chunks).strip()
+    parts = _component_list(message)
+    if parts is not None:
+        chunks = [
+            str(p.get("data") or "")
+            for p in parts
+            if isinstance(p, dict) and p.get("type") == "text"
+        ]
+        text = "".join(chunks).strip()
+        if text:
+            return text
+    plain = message.get("processed_plain_text")
+    return plain.strip() if isinstance(plain, str) else ""
 
 
 def _get_emoji_parts(message: dict[str, Any]) -> list[dict[str, Any]]:
-    parts = message.get("raw_message")
-    if not isinstance(parts, list):
+    parts = _component_list(message)
+    if parts is None:
         return []
     out = []
     for idx, p in enumerate(parts):
@@ -286,6 +354,9 @@ class EmojiSmartAuditPlugin(MaiBotPlugin):
     """发送前用视觉+语境双重判断表情包该不该发"""
 
     config_model = EmojiSmartAuditConfig
+
+    def __init__(self) -> None:
+        super().__init__()
 
     async def on_load(self) -> None:
         cfg = self.config.audit
@@ -318,19 +389,29 @@ class EmojiSmartAuditPlugin(MaiBotPlugin):
     ) -> dict[str, Any] | None:
         del kwargs
         cfg = self.config.audit
+
+        # 无论审核开没开，先清掉文本里的 emoji（模型爱发笑哭，适配器会转成 QQ 表情连发）
+        changed = False
+        if cfg.strip_emoji:
+            message, changed = self._strip_emoji(message)
+
+        # Hook 契约：修改必须包在 modified_kwargs 里，否则 Host 会丢弃并照原样发送
+        def with_message() -> dict[str, Any]:
+            return {"action": "continue", "modified_kwargs": {"message": message}}
+
         if not cfg.enabled:
-            return None
+            return with_message() if changed else None
 
         emojis = _get_emoji_parts(message)
         if not emojis:
-            return None
+            return with_message() if changed else None
 
         text = _get_text(message)
         if len(text) < cfg.skip_if_text_too_short:
-            return None
+            return with_message() if changed else None
 
         if cfg.audit_rate < 1.0 and random.random() > cfg.audit_rate:
-            return None
+            return with_message() if changed else None
 
         try:
             verdict = await asyncio.wait_for(
@@ -343,15 +424,15 @@ class EmojiSmartAuditPlugin(MaiBotPlugin):
             )
             if cfg.timeout_action == "drop":
                 return self._strip_emojis(message, emojis, "审核超时")
-            return None
+            return with_message() if changed else None
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning(f"表情包审核异常，放行：{exc}")
             if cfg.timeout_action == "drop":
                 return self._strip_emojis(message, emojis, "审核异常")
-            return None
+            return with_message() if changed else None
 
         if verdict is None:
-            return None
+            return with_message() if changed else None
 
         suitable, reason = verdict
         if cfg.log_decisions:
@@ -360,14 +441,65 @@ class EmojiSmartAuditPlugin(MaiBotPlugin):
                 f"文字={text[:18]!r} 表情数={len(emojis)} | {reason[:70]}"
             )
         if suitable:
-            return None
+            return with_message() if changed else None
         return self._strip_emojis(message, emojis, reason)
+
+    def _strip_emoji(self, message: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        """清除文本组件和 processed_plain_text 里的 emoji。
+
+        返回 (消息, 是否有改动)。整条全是 emoji 时不清理，避免发出空消息。
+        Host 反序列化会原样带回 processed_plain_text，且非空时不再重建，
+        所以两个字段必须同步清理，不能只清组件。
+        """
+        parts = message.get("raw_message")
+        if not isinstance(parts, list):
+            parts = []
+        edits: list[tuple[dict[str, Any], str, str]] = []
+        for part in parts:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                continue
+            text = part.get("data")
+            if not isinstance(text, str) or not text:
+                continue
+            new_text, removed = _strip_emoji_from_text(text)
+            if removed > 0:
+                edits.append((part, text, new_text))
+        if edits:
+            # 清理后是否还有内容：非文本组件，或任一文本组件清完非空
+            edited_ids = {id(part) for part, _, _ in edits}
+            has_content = any(
+                isinstance(p, dict) and p.get("type") != "text" for p in parts
+            ) or any(new_text.strip() for _, _, new_text in edits) or any(
+                isinstance(p, dict)
+                and p.get("type") == "text"
+                and id(p) not in edited_ids
+                and str(p.get("data") or "").strip()
+                for p in parts
+            )
+            if not has_content:
+                return message, False
+            for part, old_text, new_text in edits:
+                part["data"] = new_text
+                self.ctx.logger.info(
+                    f"清除 emoji: {old_text[:30]!r} -> {new_text[:30]!r}"
+                )
+        plain = message.get("processed_plain_text")
+        plain_changed = False
+        if isinstance(plain, str) and plain:
+            new_plain, removed = _strip_emoji_from_text(plain)
+            if removed > 0:
+                # 清成空串时 Host 会从已清理的组件重建纯文本
+                message["processed_plain_text"] = new_plain
+                plain_changed = True
+        if not edits and not plain_changed:
+            return message, False
+        return message, True
 
     def _strip_emojis(
         self, message: dict[str, Any], emojis: list[dict[str, Any]], reason: str
     ) -> dict[str, Any] | None:
-        parts = message.get("raw_message")
-        if not isinstance(parts, list):
+        parts = _component_list(message)
+        if parts is None:
             return None
         drop = {e["index"] for e in emojis}
         kept = [p for i, p in enumerate(parts) if i not in drop]
@@ -375,7 +507,7 @@ class EmojiSmartAuditPlugin(MaiBotPlugin):
             return None
         message["raw_message"] = kept
         self.ctx.logger.info(f"已撤掉表情：{reason[:70]}")
-        return {"message": message}
+        return {"action": "continue", "modified_kwargs": {"message": message}}
 
     async def _judge(
         self,
