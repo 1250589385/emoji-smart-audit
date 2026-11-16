@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "1250589385.emoji-smart-audit",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "name": "表情包智能审核",
-  "description": "发送前用视觉模型真正看懂表情包内容，再结合最近聊天语境判断配不配这句话；不合适就撤掉表情只发文字。自动适配宿主的视觉模型，任何异常都放行不影响正常说话。",
+  "description": "发送前用视觉模型真正看懂表情包内容，再结合最近聊天语境判断配不配这句话；不合适就撤掉表情只发文字。自动适配宿主的视觉模型，任何异常都放行不影响正常说话。同时清理文本里自带的笑哭类 emoji。",
   "author": {
     "name": "1250589385",
     "url": "https://github.com/1250589385"
@@ -36,6 +36,7 @@
     "message.get_recent",
     "llm.generate"
   ],
+  "changelog": "CHANGELOG.md",
   "i18n": {
     "default_locale": "zh-CN",
     "locales_path": "i18n",
